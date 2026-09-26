@@ -12,7 +12,13 @@ class DomainService:
         self.audit = AuditTrail(repository)
 
     def _lookup(self, kind, field, value):
-        return self.repository.find_entities(self.rules.normalize_kind(kind), field, value)
+        kind = self.rules.normalize_kind(kind)
+        if kind == "snapshot":
+            if field == "calibration_id":
+                snapshot = self.repository.get_snapshot(value)
+                return [snapshot] if snapshot else []
+            return []
+        return self.repository.find_entities(kind, field, value)
 
     def health(self):
         return {"status": "ok" if self.repository.ping() else "error"}
@@ -47,6 +53,8 @@ class DomainService:
         )
         merged = dict(entity["data"])
         merged.update(patch)
+        if entity["kind"] == "calibration" and action == "approve":
+            return self._approve_calibration(actor, entity, expected, next_status, patch, merged)
         updated = self.repository.update_entity(entity_id, expected, next_status, merged)
         self.audit.record(
             entity_id,
@@ -57,6 +65,66 @@ class DomainService:
             {"patch": patch},
         )
         return updated
+
+    def _approve_calibration(self, actor, calibration, expected, next_status, patch, merged):
+        """Approve a calibration: store the traceability snapshot and activate
+        the instrument in one transaction, so a failure anywhere rolls back."""
+        instrument = self.repository.get_entity(merged.get("instrument_id"))
+        if not instrument:
+            raise NotFoundError("instrument not found: " + str(merged.get("instrument_id")))
+        instrument_data = dict(instrument["data"])
+        if merged.get("due_at"):
+            instrument_data["due_at"] = merged["due_at"]
+        instrument_data["current_calibration_id"] = calibration["id"]
+        instrument_status = (
+            "active" if instrument["status"] == "calibrating" else instrument["status"]
+        )
+        self.repository.apply_updates(
+            [
+                {
+                    "id": calibration["id"],
+                    "expected_version": expected,
+                    "status": next_status,
+                    "data": merged,
+                },
+                {
+                    "id": instrument["id"],
+                    "expected_version": instrument["version"],
+                    "status": instrument_status,
+                    "data": instrument_data,
+                },
+            ],
+            snapshots=[
+                {"calibration_id": calibration["id"], "chain": merged["traceability"]}
+            ],
+        )
+        updated = self.repository.get_entity(calibration["id"])
+        self.audit.record(
+            calibration["id"],
+            actor,
+            "approve",
+            calibration["status"],
+            updated["status"],
+            {"patch": patch},
+        )
+        self.audit.record(
+            instrument["id"],
+            actor,
+            "calibration_activated",
+            instrument["status"],
+            instrument_status,
+            {
+                "calibration_id": calibration["id"],
+                "due_at": instrument_data.get("due_at"),
+            },
+        )
+        return updated
+
+    def get_snapshot(self, calibration_id):
+        snapshot = self.repository.get_snapshot(calibration_id)
+        if not snapshot:
+            raise NotFoundError("snapshot not found: " + calibration_id)
+        return snapshot
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

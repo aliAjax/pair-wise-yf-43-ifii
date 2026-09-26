@@ -32,7 +32,19 @@ class WorkflowTest(unittest.TestCase):
 
     def test_full_workflow(self):
         created = {}
-        steps = [{'op': 'create', 'as': 'instrument', 'kind': 'instrument', 'data': {'name': 'Analyzer', 'serial': 'A-1'}}, {'op': 'transition', 'target': 'instrument', 'action': 'send_calibration', 'data': {}, 'expect': 'calibrating'}, {'op': 'transition', 'target': 'instrument', 'action': 'calibrate', 'data': {'due_at': '2099-01-01', 'passed': True}, 'expect': 'active'}, {'op': 'create', 'as': 'calibration', 'kind': 'calibration', 'data': {'instrument_id': '{instrument}', 'requested_at': '2026-01-01'}}, {'op': 'transition', 'target': 'calibration', 'action': 'perform', 'data': {'result': 'passed', 'performed_at': '2026-01-02', 'uncertainty': 0.01, 'due_at': '2099-01-01'}, 'expect': 'passed'}, {'op': 'transition', 'target': 'calibration', 'action': 'approve', 'data': {'authorized_by': 'QA-1'}, 'expect': 'approved'}, {'op': 'create', 'as': 'method', 'kind': 'method', 'data': {'name': 'Assay-A', 'version': 'v1'}}, {'op': 'transition', 'target': 'method', 'action': 'validate_method', 'data': {'parameters': {'range': [0, 10]}, 'instrument_ids': ['{instrument}']}, 'expect': 'validated'}, {'op': 'create', 'as': 'result', 'kind': 'result', 'data': {'sample_id': 'S-1', 'measurement': 'initial'}}, {'op': 'transition', 'target': 'result', 'action': 'release', 'data': {'instrument_id': '{instrument}', 'method_id': '{method}', 'value': 4.2, 'unit': 'mg/L'}, 'expect': 'released'}]
+        steps = [
+            {'op': 'create', 'as': 'root_standard', 'kind': 'standard', 'data': {'code': 'STD-ROOT', 'calibrated_at': '2025-01-10', 'due_at': '2030-01-10'}},
+            {'op': 'create', 'as': 'working_standard', 'kind': 'standard', 'data': {'code': 'STD-1', 'calibrated_at': '2025-06-01', 'due_at': '2027-06-01', 'higher_standard_code': 'STD-ROOT'}},
+            {'op': 'create', 'as': 'instrument', 'kind': 'instrument', 'data': {'name': 'Analyzer', 'serial': 'A-1'}},
+            {'op': 'transition', 'target': 'instrument', 'action': 'send_calibration', 'data': {}, 'expect': 'calibrating'},
+            {'op': 'create', 'as': 'calibration', 'kind': 'calibration', 'data': {'instrument_id': '{instrument}', 'requested_at': '2026-01-01', 'standard_code': 'STD-1'}},
+            {'op': 'transition', 'target': 'calibration', 'action': 'perform', 'data': {'result': 'passed', 'performed_at': '2026-01-02', 'uncertainty': 0.01, 'due_at': '2099-01-01'}, 'expect': 'passed'},
+            {'op': 'transition', 'target': 'calibration', 'action': 'approve', 'data': {'authorized_by': 'QA-1'}, 'expect': 'approved'},
+            {'op': 'create', 'as': 'method', 'kind': 'method', 'data': {'name': 'Assay-A', 'version': 'v1'}},
+            {'op': 'transition', 'target': 'method', 'action': 'validate_method', 'data': {'parameters': {'range': [0, 10]}, 'instrument_ids': ['{instrument}']}, 'expect': 'validated'},
+            {'op': 'create', 'as': 'result', 'kind': 'result', 'data': {'sample_id': 'S-1', 'measurement': 'initial'}},
+            {'op': 'transition', 'target': 'result', 'action': 'release', 'data': {'instrument_id': '{instrument}', 'method_id': '{method}', 'value': 4.2, 'unit': 'mg/L'}, 'expect': 'released'},
+        ]
         for step in steps:
             if step["op"] == "create":
                 entity = self.service.create(
@@ -52,6 +64,27 @@ class WorkflowTest(unittest.TestCase):
                 )
             if "expect" in step:
                 self.assertEqual(entity["status"], step["expect"])
+
+        # 审批通过后仪器生效：状态恢复 active，写回到期日和当前校准记录
+        instrument = self.service.get(created["instrument"])
+        self.assertEqual(instrument["status"], "active")
+        self.assertEqual(instrument["data"]["due_at"], "2099-01-01")
+        self.assertEqual(instrument["data"]["current_calibration_id"], created["calibration"])
+
+        # 溯源快照随审批保存，包含从工作标准到参考标准的完整链路
+        snapshot = self.service.get_snapshot(created["calibration"])
+        self.assertEqual(
+            [node["code"] for node in snapshot["chain"]],
+            ["STD-1", "STD-ROOT"],
+        )
+
+        # 放行结果携带采用的完整溯源链路
+        result = self.service.get(created["result"])
+        self.assertEqual(result["data"]["calibration_id"], created["calibration"])
+        self.assertEqual(
+            [node["code"] for node in result["data"]["traceability_chain"]],
+            ["STD-1", "STD-ROOT"],
+        )
 
 
 if __name__ == "__main__":
