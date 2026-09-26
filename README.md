@@ -26,6 +26,14 @@ python3 app.py --db ./data.db --port 8309
 
 - `instrument`：仪器状态；`calibration`：校准记录；`method`：方法版本；`result`：检测结果。
 
+## 溯源链与快照
+
+- 校准执行（`perform`）时必须登记所用标准器编号`standard_id`；在`instrument`上标记`is_reference: true`的基准仪器除外，它是溯源链顶端。
+- 审批（`approve`）时沿标准器的校验链逐级向上检查：日期先后（标准器校准日期不得晚于使用日期）、有效期（使用日期不得超过标准器校准到期日）、断链（标准器不存在或无已批准校准）和成环（链上重复出现同一标准器）。
+- 检查失败时审批被退回：记录保持`passed`状态，错误响应和审计（`approve_returned`）中列出问题节点，修正后可重新`perform`再审批。
+- 审批通过后，完整链路作为`traceability_snapshot`存入校准记录，仪器同步置为`active`并更新`due_at`（隔离中的仪器只更新`due_at`）。快照是批准时刻的副本，标准器日后再校准不会改写旧快照。
+- 结果放行（`release`）时，仪器最近已批准校准的快照作为`traceability_chain`写入结果，返回采用的完整链路。
+
 ## 主要接口
 
 - `GET /health`：健康检查。

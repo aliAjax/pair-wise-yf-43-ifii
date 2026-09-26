@@ -4,6 +4,7 @@ from .domain import (
     ConflictError,
     InvalidTransition,
     PermissionDenied,
+    TraceabilityError,
     ValidationError,
 )
 
@@ -19,10 +20,101 @@ def _validate_perform(actor, entity, data, lookup):
         raise ValidationError("calibration result must be passed or failed")
     if data.get("result") == "passed" and not data.get("due_at"):
         raise ValidationError("passed calibration requires due_at")
+    instrument = _find_one(lookup, "instrument", "id", entity["data"].get("instrument_id"))
+    if (
+        data.get("result") == "passed"
+        and instrument
+        and not instrument["data"].get("is_reference")
+        and not data.get("standard_id")
+    ):
+        raise ValidationError("passed calibration requires the standard_id used")
 
 
 def calibration_current(due_at, as_of):
     return str(due_at) >= str(as_of)
+
+
+def _latest_approved_calibration(lookup, instrument_id):
+    rows = lookup("calibration", "instrument_id", instrument_id) or []
+    approved = [row for row in rows if row["status"] == "approved"]
+    if not approved:
+        return None
+    return max(approved, key=lambda row: str(row["data"].get("performed_at", "")))
+
+
+def _traceability_chain(calibration_data, lookup):
+    """Walk the standard chain upwards checking order, validity, breaks and cycles."""
+    chain = []
+    problems = []
+    visited = set()
+    standard_id = calibration_data.get("standard_id")
+    used_at = calibration_data.get("performed_at")
+    while standard_id:
+        if standard_id in visited:
+            problems.append({
+                "issue": "cycle",
+                "standard_id": standard_id,
+                "detail": "standard already appears in the chain",
+            })
+            break
+        visited.add(standard_id)
+        standard = _find_one(lookup, "instrument", "id", standard_id)
+        if not standard:
+            problems.append({
+                "issue": "broken",
+                "standard_id": standard_id,
+                "detail": "standard instrument does not exist",
+            })
+            break
+        standard_calibration = _latest_approved_calibration(lookup, standard_id)
+        if not standard_calibration:
+            problems.append({
+                "issue": "broken",
+                "standard_id": standard_id,
+                "detail": "standard has no approved calibration",
+            })
+            break
+        cal_data = standard_calibration["data"]
+        node = {
+            "standard_id": standard_id,
+            "serial": standard["data"].get("serial"),
+            "calibration_id": standard_calibration["id"],
+            "performed_at": cal_data.get("performed_at"),
+            "due_at": cal_data.get("due_at"),
+        }
+        chain.append(node)
+        if used_at and node["performed_at"] and str(used_at) < str(node["performed_at"]):
+            problems.append(dict(node, issue="order", detail="standard was calibrated after it was used"))
+        if used_at and node["due_at"] and not calibration_current(node["due_at"], used_at):
+            problems.append(dict(node, issue="expired", detail="standard calibration expired before it was used"))
+        used_at = node["performed_at"]
+        standard_id = cal_data.get("standard_id")
+    return chain, problems
+
+
+def _validate_approve(actor, entity, data, lookup):
+    instrument = _find_one(lookup, "instrument", "id", entity["data"].get("instrument_id"))
+    if not instrument:
+        raise ValidationError("instrument does not exist")
+    if instrument["data"].get("is_reference"):
+        return {"traceability_snapshot": []}
+    if not entity["data"].get("standard_id"):
+        raise TraceabilityError(
+            "traceability chain broken: calibration has no standard_id",
+            problems=[{
+                "issue": "broken",
+                "standard_id": None,
+                "detail": "calibration has no standard_id",
+            }],
+        )
+    chain, problems = _traceability_chain(entity["data"], lookup)
+    if problems:
+        summary = "; ".join(
+            "%s at %s: %s" % (p["issue"], p.get("standard_id"), p["detail"])
+            for p in problems
+        )
+        raise TraceabilityError("traceability chain rejected: " + summary, problems=problems)
+    return {"traceability_snapshot": chain}
 
 
 def _validate_result_release(actor, entity, data, lookup):
@@ -36,17 +128,19 @@ def _validate_result_release(actor, entity, data, lookup):
         raise ValidationError("result requires a validated method")
     if data.get("instrument_id") not in method["data"].get("instrument_ids", []):
         raise ValidationError("method is not validated for this instrument")
-    return {"released_by": actor.user_id}
+    calibration = _latest_approved_calibration(lookup, data.get("instrument_id"))
+    chain = calibration["data"].get("traceability_snapshot", []) if calibration else []
+    return {"released_by": actor.user_id, "traceability_chain": chain}
 
 
 CUSTOM_CREATE = {'calibration': _validate_calibration}
-CUSTOM_TRANSITIONS = {('calibration', 'perform'): _validate_perform, ('result', 'release'): _validate_result_release}
+CUSTOM_TRANSITIONS = {('calibration', 'perform'): _validate_perform, ('calibration', 'approve'): _validate_approve, ('result', 'release'): _validate_result_release}
 
 
 class RuleEngine:
     ALIASES = {'instruments': 'instrument', 'calibrations': 'calibration', 'methods': 'method', 'results': 'result'}
     INITIAL_STATUS = {'instrument': 'active', 'calibration': 'requested', 'method': 'draft', 'result': 'pending'}
-    TRANSITIONS = {'instrument': {'send_calibration': (('active',), 'calibrating'), 'calibrate': (('calibrating',), 'active'), 'quarantine': (('active',), 'quarantined'), 'restore': (('quarantined',), 'active')}, 'calibration': {'perform': (('requested', 'failed'), 'passed'), 'approve': (('passed',), 'approved'), 'reject': (('failed',), 'rejected')}, 'method': {'validate_method': (('draft',), 'validated'), 'revoke_method': (('validated',), 'revoked')}, 'result': {'release': (('pending',), 'released'), 'block': (('pending',), 'blocked'), 'reanalyze': (('blocked',), 'pending')}}
+    TRANSITIONS = {'instrument': {'send_calibration': (('active',), 'calibrating'), 'calibrate': (('calibrating',), 'active'), 'quarantine': (('active',), 'quarantined'), 'restore': (('quarantined',), 'active')}, 'calibration': {'perform': (('requested', 'failed', 'passed'), 'passed'), 'approve': (('passed',), 'approved'), 'reject': (('failed',), 'rejected')}, 'method': {'validate_method': (('draft',), 'validated'), 'revoke_method': (('validated',), 'revoked')}, 'result': {'release': (('pending',), 'released'), 'block': (('pending',), 'blocked'), 'reanalyze': (('blocked',), 'pending')}}
     CREATE_REQUIRED = {'instrument': ('name', 'serial'), 'calibration': ('instrument_id', 'requested_at'), 'method': ('name', 'version'), 'result': ('sample_id', 'measurement')}
     ACTION_REQUIRED = {('instrument', 'calibrate'): ('due_at', 'passed'), ('instrument', 'quarantine'): ('reason',), ('calibration', 'perform'): ('result', 'performed_at', 'uncertainty'), ('calibration', 'approve'): ('authorized_by',), ('calibration', 'reject'): ('reason',), ('method', 'validate_method'): ('parameters', 'instrument_ids'), ('method', 'revoke_method'): ('reason',), ('result', 'release'): ('instrument_id', 'method_id', 'value', 'unit'), ('result', 'block'): ('reason',), ('result', 'reanalyze'): ('reason',)}
     CREATE_ROLES = {'instrument': ('admin', 'technician'), 'calibration': ('admin', 'metrology'), 'method': ('admin', 'authorizer'), 'result': ('admin', 'analyst')}

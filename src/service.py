@@ -1,7 +1,7 @@
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, TraceabilityError
 from .rules import RuleEngine
 
 
@@ -42,9 +42,20 @@ class DomainService:
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
         expected = int(expected_version) if expected_version is not None else entity["version"]
-        next_status, patch = self.rules.validate_transition(
-            actor, entity, action, dict(data or {}), self._lookup
-        )
+        try:
+            next_status, patch = self.rules.validate_transition(
+                actor, entity, action, dict(data or {}), self._lookup
+            )
+        except TraceabilityError as exc:
+            self.audit.record(
+                entity_id,
+                actor,
+                action + "_returned",
+                entity["status"],
+                entity["status"],
+                {"problems": exc.problems},
+            )
+            raise
         merged = dict(entity["data"])
         merged.update(patch)
         updated = self.repository.update_entity(entity_id, expected, next_status, merged)
@@ -56,7 +67,33 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        if entity["kind"] == "calibration" and action == "approve":
+            self._activate_instrument(actor, updated)
         return updated
+
+    def _activate_instrument(self, actor, calibration):
+        instrument_id = calibration["data"].get("instrument_id")
+        if not instrument_id:
+            return
+        instrument = self.repository.get_entity(instrument_id)
+        if not instrument:
+            return
+        data = dict(instrument["data"])
+        if calibration["data"].get("due_at"):
+            data["due_at"] = calibration["data"]["due_at"]
+        status = instrument["status"]
+        next_status = status if status == "quarantined" else "active"
+        if next_status == status and data == instrument["data"]:
+            return
+        self.repository.update_entity(instrument_id, None, next_status, data)
+        self.audit.record(
+            instrument_id,
+            actor,
+            "activate",
+            status,
+            next_status,
+            {"calibration_id": calibration["id"], "due_at": data.get("due_at")},
+        )
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

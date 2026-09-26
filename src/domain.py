@@ -27,6 +27,14 @@ class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
 
+class TraceabilityError(ValidationError):
+    """The calibration traceability chain check failed."""
+
+    def __init__(self, message, problems=None):
+        super().__init__(message)
+        self.problems = problems or []
+
+
 class Role(str, Enum):
     viewer = "viewer"
     admin = "admin"
